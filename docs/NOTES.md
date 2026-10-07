@@ -63,3 +63,7 @@
 - Cap yaw to ~20-25 deg as the cheap mitigation.
 - Run on more faces (beards, glasses, off-axis, non-flat bg: fit is skipped when bg isn't flat; no-face -> raw LAM silently).
 - Licensing: LAM weights (HF Apache-2.0 vs GitHub CC-BY-NC) unresolved; Apple Vision is macOS/iOS-only; DA2 Base/Large are CC-BY-NC (Small is Apache-2.0).
+
+## Depth mesh (viewer) and why not triangulate the splat centres
+- `index.html` bakes the splats' frontal render (colour + coverage-weighted expected depth, 768px, RGBA16F) and draws a 256x256 grid displaced by that depth (`mesh blend` slider mixes it with the splats). No edge-on shards; the depth map is mip-blurred (lod 3.5 in `mvs`) to hide feature jitter.
+- Tried: Delaunay of the splat centres in frontal xy (topology saved once from the raw canonical grid, applied to any result since splat index = face location), vertex colours/UVs from the bake, Laplacian smoothing. Worse: the canonical cloud is multi-layer (eyes, lips, lashes, hair float over skin at different z), so xy-neighbours are not surface neighbours. A 3x-median edge filter drops ~9k triangles on the face (z jumps) -> holes; no filter -> rippled surface. FLAME's real topology is what would fix it, and that was dropped. Reverted.
