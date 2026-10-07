@@ -1,0 +1,10 @@
+coremltools
+numpy
+scipy
+pillow
+plyfile
+matplotlib
+opencv-python-headless
+torch
+transformers
+huggingface-hub

@@ -1,0 +1,309 @@
+<!doctype html>
+<meta charset="utf-8"><title>LAM head turn</title>
+<style>
+ html,body{margin:0;height:100%;background:#111;color:#ddd;font:13px system-ui;overflow:hidden}
+ canvas{width:100%;height:100%;display:block}
+ #ui{position:fixed;top:10px;left:10px;background:#000a;padding:10px;border-radius:8px;display:flex;flex-direction:column;gap:6px;max-width:260px}
+ #ui label{display:flex;justify-content:space-between;gap:8px;align-items:center}
+ #drop{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:#0008;font-size:24px}
+ #status{opacity:.8}
+</style>
+<canvas id="c"></canvas>
+<div id="ui">
+ <b>Drop a headshot (jpg/png) or a .ply</b>
+ <input type="file" id="file" accept="image/*,.ply">
+ <label>zoom <input type="range" id="zoom" min="1" max="2.5" step="0.05" value="1"></label>
+ <label>splat size <input type="range" id="size" min="0.5" max="6" step="0.1" value="1"></label>
+ <label>model scale <input type="range" id="mscale" min="1" max="12" step="0.1" value="1"></label>
+ <label>max yaw° <input type="range" id="maxyaw" min="5" max="90" step="1" value="30"></label>
+ <label>flip Y <input type="checkbox" id="fy"></label>
+ <label>flip Z <input type="checkbox" id="fz"></label>
+ <label>cutout first (Apple Vision) <input type="checkbox" id="matte" checked></label>
+ <label>depth refine (landmarks+depth) <input type="checkbox" id="refine" checked></label>
+ <label>photo fit (slower, sharper) <input type="checkbox" id="fit" checked></label>
+ <label>backdrop <input type="checkbox" id="bd" checked></label>
+ <label>parallax depth <input type="range" id="par" min="-4" max="4" step="0.1" value="1.5"></label>
+ <label>backdrop scale <input type="range" id="bscale" min="0.5" max="2.5" step="0.05" value="1"></label>
+ <img id="prev" style="width:100%;border-radius:4px;display:none">
+ <label>cursor follow <input type="checkbox" id="follow" checked></label>
+ <div id="status">idle</div>
+</div>
+<div id="drop">Drop to load</div>
+<script>
+const $=id=>document.getElementById(id), cv=$('c'), gl=cv.getContext('webgl2',{antialias:false});
+const vs=`#version 300 es
+in vec2 corner; in vec3 ctr; in vec3 scl; in vec4 rot; in vec4 col;
+uniform mat4 mv, proj; uniform vec2 vp; uniform float sz;
+out vec4 vcol; out vec2 vpos;
+void main(){
+ vec4 c4=mv*vec4(ctr,1.); vec3 t=c4.xyz;
+ if(t.z>-0.01){gl_Position=vec4(2,2,2,1);return;}
+ float w=rot.x,x=rot.y,y=rot.z,z=rot.w;
+ mat3 R=mat3(1.-2.*(y*y+z*z),2.*(x*y+w*z),2.*(x*z-w*y),
+             2.*(x*y-w*z),1.-2.*(x*x+z*z),2.*(y*z+w*x),
+             2.*(x*z+w*y),2.*(y*z-w*x),1.-2.*(x*x+y*y));
+ mat3 M=R*mat3(scl.x,0,0,0,scl.y,0,0,0,scl.z);
+ mat3 S=M*transpose(M);
+ mat3 W=mat3(mv);
+ float fx=proj[0][0]*vp.x*.5, fy=proj[1][1]*vp.y*.5, z2=t.z;
+ mat3 J=mat3(fx/z2,0,0, 0,fy/z2,0, -fx*t.x/(z2*z2),-fy*t.y/(z2*z2),0);
+ mat3 T=J*W; mat3 C=T*S*transpose(T);
+ float a=C[0][0]+.3,b=C[0][1],d=C[1][1]+.3;
+ float mid=.5*(a+d), r=length(vec2(.5*(a-d),b));
+ float l1=mid+r, l2=max(mid-r,.1);
+ vec2 e1=normalize(vec2(b,l1-a)); if(abs(b)<1e-6) e1=a>=d?vec2(1,0):vec2(0,1);
+ vec2 e2=vec2(e1.y,-e1.x);
+ vec2 off=(corner.x*sqrt(l1)*e1+corner.y*sqrt(l2)*e2)*3.*sz;
+ vec4 p=proj*c4;
+ gl_Position=vec4(p.xy/p.w+off*2./vp, p.z/p.w,1.);
+ vcol=col; vpos=corner*3.;
+}`;
+const fs=`#version 300 es
+precision highp float; in vec4 vcol; in vec2 vpos; out vec4 o;
+void main(){ float r=dot(vpos,vpos); if(r>9.)discard; float a=exp(-.5*r)*vcol.a; o=vec4(vcol.rgb*a,a);}`;
+function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(o);return o}
+const pg=gl.createProgram();gl.attachShader(pg,sh(gl.VERTEX_SHADER,vs));gl.attachShader(pg,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(pg);
+if(!gl.getProgramParameter(pg,gl.LINK_STATUS))throw gl.getProgramInfoLog(pg);
+gl.useProgram(pg);
+const U=n=>gl.getUniformLocation(pg,n), A=n=>gl.getAttribLocation(pg,n);
+const quad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(A('corner'));gl.vertexAttribPointer(A('corner'),2,gl.FLOAT,false,0,0);
+const inst=gl.createBuffer(); const STRIDE=14*4; let N=0, data=null, cent=[0,0,0], radius=1;
+gl.bindBuffer(gl.ARRAY_BUFFER,inst);
+['ctr:3:0','scl:3:3','rot:4:6','col:4:10'].forEach(s=>{const [n,k,o]=s.split(':');const l=A(n);gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,+k,gl.FLOAT,false,STRIDE,+o*4);gl.vertexAttribDivisor(l,1)});
+gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+
+function parsePly(buf){
+ const u8=new Uint8Array(buf), head=new TextDecoder().decode(u8.slice(0,4000)), he=head.indexOf('end_header\n')+11;
+ const n=+head.match(/element vertex (\d+)/)[1];
+ const props=[...head.slice(0,he).matchAll(/property float (\w+)/g)].map(m=>m[1]);
+ const dv=new DataView(buf,he), st=props.length*4, ix=Object.fromEntries(props.map((p,i)=>[p,i]));
+ const f=(i,p)=>dv.getFloat32(i*st+ix[p]*4,true), SH=0.28209479177387814, sg=v=>1/(1+Math.exp(-v));
+ const out=new Float32Array(n*14);
+ for(let i=0;i<n;i++){const o=i*14;
+  out[o]=f(i,'x');out[o+1]=f(i,'y');out[o+2]=f(i,'z');
+  out[o+3]=Math.exp(f(i,'scale_0'));out[o+4]=Math.exp(f(i,'scale_1'));out[o+5]=Math.exp(f(i,'scale_2'));
+  out[o+6]=f(i,'rot_0');out[o+7]=f(i,'rot_1');out[o+8]=f(i,'rot_2');out[o+9]=f(i,'rot_3');
+    out[o+10]=.5+SH*f(i,'f_dc_0');out[o+11]=.5+SH*f(i,'f_dc_1');out[o+12]=.5+SH*f(i,'f_dc_2');
+  out[o+13]=sg(f(i,'opacity'));}
+ return {n,out};
+}
+function setSplats({n,out}){
+ dirty=true;N=n;data=out;let c=[0,0,0];for(let i=0;i<n;i++)for(let k=0;k<3;k++)c[k]+=out[i*14+k]/n;cent=c;
+ let r=0;for(let i=0;i<n;i++){let d=0;for(let k=0;k<3;k++)d+=(out[i*14+k]-c[k])**2;r+=Math.sqrt(d)}radius=Math.max(r/n*2,.05);
+ order=new Uint32Array(n).map((_,i)=>i);
+ sorted=new Float32Array(n*14);gl.bindBuffer(gl.ARRAY_BUFFER,inst);gl.bufferData(gl.ARRAY_BUFFER,sorted.byteLength,gl.DYNAMIC_DRAW);
+ $('status').textContent=`${n} gaussians, radius≈${radius.toFixed(3)}`;
+}
+let order,sorted,dirty=true,lastW=0,lastH=0; // dirty = something changed -> redraw; idle frames are skipped so the GPU/fans can rest
+addEventListener('input',()=>dirty=true);addEventListener('resize',()=>dirty=true);
+// matrices (column-major)
+const mul=(a,b)=>{const o=new Float32Array(16);for(let c=0;c<4;c++)for(let r=0;r<4;r++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+r]*b[c*4+k];o[c*4+r]=s}return o};
+const trans=(x,y,z)=>new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1]);
+const rotY=a=>{const c=Math.cos(a),s=Math.sin(a);return new Float32Array([c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1])};
+const rotX=a=>{const c=Math.cos(a),s=Math.sin(a);return new Float32Array([1,0,0,0,0,c,s,0,0,-s,c,0,0,0,0,1])};
+const scaleM=(x,y,z)=>new Float32Array([x,0,0,0,0,y,0,0,0,0,z,0,0,0,0,1]);
+function persp(f,a,n,fa){const t=1/Math.tan(f/2);return new Float32Array([t/a,0,0,0,0,t,0,0,0,0,(fa+n)/(n-fa),-1,0,0,2*fa*n/(n-fa),0])}
+const FOV=.3, DISTK=3.2*Math.tan(.4)/Math.tan(FOV/2); // portrait-lens camera, same as splatrender.py (FOV / DIST_K)
+let tgtYaw=0,tgtPitch=0,yaw=0,pitch=0,lastYaw=NaN,lastPitch=NaN;
+addEventListener('mousemove',e=>{if(!$('follow').checked)return;const m=$('maxyaw').value*Math.PI/180;
+ tgtYaw=((e.clientX/innerWidth)*2-1)*m;tgtPitch=((e.clientY/innerHeight)*2-1)*m*.6});
+function frame(){
+ requestAnimationFrame(frame);
+ const dpr=devicePixelRatio;const w=cv.clientWidth*dpr|0,h=cv.clientHeight*dpr|0;if(cv.width!=w||cv.height!=h){cv.width=w;cv.height=h}
+ yaw+=(tgtYaw-yaw)*.12;pitch+=(tgtPitch-pitch)*.12;
+ if(Math.abs(tgtYaw-yaw)<2e-4)yaw=tgtYaw;if(Math.abs(tgtPitch-pitch)<2e-4)pitch=tgtPitch;
+ const moving=yaw!==tgtYaw||pitch!==tgtPitch||yaw!==lastYaw||pitch!==lastPitch;
+ if(!moving&&!dirty&&w===lastW&&h===lastH)return;  // idle: leave the last frame on screen (clearing here would blank it)
+ dirty=false;lastW=w;lastH=h;lastYaw=yaw;lastPitch=pitch;
+ gl.viewport(0,0,w,h);gl.clearColor(.07,.07,.07,1);gl.clear(gl.COLOR_BUFFER_BIT);
+ if(!N)return;
+ const ms=+$('mscale').value, fy=$('fy').checked?-1:1, fz=$('fz').checked?-1:1;
+ const dist=radius*ms*DISTK;
+ const model=mul(rotX(pitch),mul(rotY(yaw),mul(scaleM(ms,ms*fy,ms*fz),trans(-cent[0],-cent[1],-cent[2]))));
+ const mv=mul(trans(0,0,-dist),model), proj=persp(FOV,w/h,.01,100);
+ drawPlane(mv,proj,dist/ms);
+ // sort back-to-front by view z
+ const d=new Float32Array(N);for(let i=0;i<N;i++){const o=i*14;d[i]=mv[2]*data[o]+mv[6]*data[o+1]+mv[10]*data[o+2]}
+ order.sort((a,b)=>d[a]-d[b]);
+ for(let j=0;j<N;j++)sorted.set(data.subarray(order[j]*14,order[j]*14+14),j*14);
+ gl.bindBuffer(gl.ARRAY_BUFFER,inst);gl.bufferSubData(gl.ARRAY_BUFFER,0,sorted);
+ gl.uniformMatrix4fv(U('mv'),false,mv);gl.uniformMatrix4fv(U('proj'),false,proj);gl.uniform2f(U('vp'),w,h);gl.uniform1f(U('sz'),+$('size').value);
+ // scale applied in model matrix -> gaussian scales scale with it via mat3(mv)
+ gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,N);
+}
+
+// ---- backdrop: tiny low-res fill of the background, drawn behind the splats with parallax ----
+const bvs=`#version 300 es
+out vec2 ndc; void main(){vec2 p=vec2(float(gl_VertexID&1),float(gl_VertexID>>1)); ndc=p*2.-1.; gl_Position=vec4(ndc,.999,1.);}`;
+const bfs=`#version 300 es
+precision highp float; in vec2 ndc; out vec4 o; uniform sampler2D tex; uniform vec2 vp; uniform vec2 shift; uniform float side;
+void main(){ vec2 px=(ndc-shift)*.5*vp; vec2 uv=vec2(.5+px.x/side,.5-px.y/side); o=vec4(texture(tex,uv).rgb,1.); }`;
+const bpg=gl.createProgram();gl.attachShader(bpg,sh(gl.VERTEX_SHADER,bvs));gl.attachShader(bpg,sh(gl.FRAGMENT_SHADER,bfs));gl.linkProgram(bpg);
+if(!gl.getProgramParameter(bpg,gl.LINK_STATUS))throw gl.getProgramInfoLog(bpg);
+let btex=null, bgColor=[.07,.07,.07];
+function setBackdrop(rgb,n){
+ dirty=true; // rgb: Uint8 n*n*3
+ if(!btex)btex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,btex);
+ gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
+ gl.texImage2D(gl.TEXTURE_2D,0,gl.RGB8,n,n,0,gl.RGB,gl.UNSIGNED_BYTE,rgb);
+ gl.generateMipmap(gl.TEXTURE_2D);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+ gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+}
+function drawBackdrop(w,h,proj,dist){
+ if(!btex||!$('bd').checked)return;
+ // backdrop = a plane D behind the head pivot, rotating with it: how far does that point move on screen?
+ const D=radius*(+$('par').value), cy=Math.cos(yaw),sy=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch);
+ let x=sy*-D, z=cy*-D, y=0; // rotY applied to (0,0,-D)
+ const y2=cp*y-sp*z, z2=sp*y+cp*z;
+ const ndcOf=(px,py,pz)=>[proj[0]*px/(dist-pz),proj[5]*py/(dist-pz)];
+ const a=ndcOf(x,y2,z2), b=ndcOf(0,0,-D);
+ gl.disable(gl.BLEND);gl.useProgram(bpg);gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,btex);
+ gl.uniform1i(gl.getUniformLocation(bpg,'tex'),0);
+ gl.uniform2f(gl.getUniformLocation(bpg,'vp'),w,h);
+ gl.uniform2f(gl.getUniformLocation(bpg,'shift'),a[0]-b[0],a[1]-b[1]);
+ gl.uniform1f(gl.getUniformLocation(bpg,'side'),Math.max(w,h)*(+$('bscale').value)); // square image covers the whole viewport; no tiling
+ gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+ gl.useProgram(pg);gl.enable(gl.BLEND);
+}
+// push-pull fill: img n*n float RGB with weight w (0 = hole)
+function pushPull(col,wt,n){
+ const lv=[{c:col,w:wt,n}];
+ while(lv[lv.length-1].n>1){const p=lv[lv.length-1],m=p.n>>1,c=new Float32Array(m*m*3),w=new Float32Array(m*m);
+  for(let y=0;y<m;y++)for(let x=0;x<m;x++)for(let dy=0;dy<2;dy++)for(let dx=0;dx<2;dx++){const i=(2*y+dy)*p.n+2*x+dx,j=y*m+x;w[j]+=p.w[i];for(let k=0;k<3;k++)c[j*3+k]+=p.c[i*3+k]*p.w[i]}
+  for(let j=0;j<m*m;j++){if(w[j]>0){for(let k=0;k<3;k++)c[j*3+k]/=w[j]}w[j]=Math.min(1,w[j])}
+  lv.push({c,w,n:m});}
+ // un-normalised sums above were weight-averaged already (c divided by weight); now pull back down
+ for(let l=lv.length-2;l>=0;l--){const f=lv[l],cs=lv[l+1];
+  for(let y=0;y<f.n;y++)for(let x=0;x<f.n;x++){const i=y*f.n+x;const a=f.w[i];if(a>=1)continue;
+   const j=(y>>1)*cs.n+(x>>1);for(let k=0;k<3;k++)f.c[i*3+k]=f.c[i*3+k]*a+cs.c[j*3+k]*(1-a);f.w[i]=1;}}
+ return lv[0].c;
+}
+
+// ---- backdrop plane in the splats' own 3D space, sized so the photo's person silhouette lines up with the splat extent
+const pvs=`#version 300 es
+uniform mat4 mv,proj; uniform vec3 pc; uniform float S; out vec2 uv;
+void main(){vec2 p=vec2(float(gl_VertexID&1),float(gl_VertexID>>1)); uv=vec2(p.x,1.-p.y);
+ gl_Position=proj*mv*vec4(pc.xy+(p-.5)*S,pc.z,1.);}`;
+const pfs=`#version 300 es
+precision highp float; in vec2 uv; out vec4 o; uniform sampler2D tex; uniform float feather;
+void main(){float a=smoothstep(0.,feather,min(min(uv.x,1.-uv.x),min(uv.y,1.-uv.y))); o=vec4(texture(tex,uv).rgb*a,a);}`;
+const ppg=gl.createProgram();gl.attachShader(ppg,sh(gl.VERTEX_SHADER,pvs));gl.attachShader(ppg,sh(gl.FRAGMENT_SHADER,pfs));gl.linkProgram(ppg);
+if(!gl.getProgramParameter(ppg,gl.LINK_STATUS))throw gl.getProgramInfoLog(ppg);
+let plane=null; // {cx,cy,S0}  S0 = world side at head depth
+function alignBackdrop(mb){
+ // splat silhouette: high-opacity splats, robust extents
+ const xs=[],ys=[];for(let i=0;i<N;i++){const o=i*14;if(data[o+13]>.3){xs.push(data[o]);ys.push(data[o+1])}}
+ const pc=(v,p)=>{v.sort((a,b)=>a-b);return v[Math.min(v.length-1,Math.floor(p*v.length))]};
+ const sx0=pc(xs,.01),sx1=pc(xs,.99),sTop=pc(ys,.99);
+ const m=mb||{x0:.25,x1:.75,y0:.1};
+ const S0=(sx1-sx0)/Math.max(.2,m.x1-m.x0);
+ plane={cx:(sx0+sx1)/2-((m.x0+m.x1)/2-.5)*S0, cy:sTop-S0/2+m.y0*S0, S0};
+}
+function drawPlane(mv,proj,distM){
+ if(!btex||!plane||!$('bd').checked)return;
+ const D=radius*(+$('par').value), S=plane.S0*(+$('bscale').value)*(distM+D)/distM;  // grow with depth so it lines up at the head
+ gl.useProgram(ppg);gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+ gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,btex);
+ const u=n=>gl.getUniformLocation(ppg,n);
+ gl.uniformMatrix4fv(u('mv'),false,mv);gl.uniformMatrix4fv(u('proj'),false,proj);gl.uniform1i(u('tex'),0);
+ gl.uniform3f(u('pc'),plane.cx,plane.cy,cent[2]-D);gl.uniform1f(u('S'),S);gl.uniform1f(u('feather'),.03);
+ gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+ gl.useProgram(pg);
+}
+let lastFile=null;
+async function matteVision(file,w,h){ // Apple Vision subject lift via the local server; returns alpha at (w,h)
+ const r=await fetch('/matte',{method:'POST',body:file});
+ if(!r.ok)throw new Error('matte: '+r.status+' '+r.statusText);
+ const bmp=await createImageBitmap(await r.blob());
+ const c=document.createElement('canvas');c.width=w;c.height=h;const x=c.getContext('2d',{willReadFrequently:true});x.drawImage(bmp,0,0,w,h);
+ const d=x.getImageData(0,0,w,h).data;let a=new Float32Array(w*h);for(let i=0;i<w*h;i++)a[i]=d[i*4+3]/255;
+ // erode ~2px: Vision leaves a thin halo of the old background colour at the edge
+ const r2=Math.max(1,Math.round(Math.min(w,h)/500));
+ for(let pass=0;pass<2*r2;pass++){const n=new Float32Array(a);for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){const i=y*w+x;n[i]=Math.min(a[i],a[i-1],a[i+1],a[i-w],a[i+w])}a=n}
+ return {a};
+}
+function squareCrop(w,h,zoom){const s=Math.min(w,h)/zoom;return {l:(w-s)/2,t:(h-s)/3,s}}
+async function prepare(file){
+ const bmp=await createImageBitmap(file), w=bmp.width,h=bmp.height;
+ const cv0=document.createElement('canvas');cv0.width=w;cv0.height=h;const cx=cv0.getContext('2d',{willReadFrequently:true});cx.drawImage(bmp,0,0);
+ const img=cx.getImageData(0,0,w,h);
+ if(!$('matte').checked){return {blob:file,bd:null,preview:null}}
+ let nTrans=0;for(let i=3;i<img.data.length;i+=28)if(img.data[i]<250)nTrans++;
+ const hasAlpha=nTrans/(w*h/7)>.05;  // real transparency = a perfect matte, skip MODNet
+ const A=new Float32Array(w*h);
+
+ const m=await matteVision(file,w,h);  // alpha only used when the image has none of its own
+ if(hasAlpha){for(let i=0;i<w*h;i++)A[i]=img.data[i*4+3]/255}else A.set(m.a);
+ // background colour = mean of confident-background pixels (neutral warm grey when the image has none)
+ let r=0,g=0,b=0,c=0;if(!hasAlpha)for(let i=0;i<w*h;i+=7)if(A[i]<.05){r+=img.data[i*4];g+=img.data[i*4+1];b+=img.data[i*4+2];c++}
+ const bg=c?[r/c,g/c,b/c]:[125,120,115];
+ // composite person onto flat bg colour for LAM
+ const comp=new ImageData(w,h);
+ for(let i=0;i<w*h;i++){const al=A[i];for(let k=0;k<3;k++)comp.data[i*4+k]=al*img.data[i*4+k]+(1-al)*bg[k];comp.data[i*4+3]=255}
+ cx.putImageData(comp,0,0);
+ const {l,t,s}=squareCrop(w,h,+$('zoom').value);
+ const oc=document.createElement('canvas');oc.width=oc.height=518;const ox=oc.getContext('2d');
+ ox.fillStyle=`rgb(${bg.map(Math.round)})`;ox.fillRect(0,0,518,518);
+ ox.drawImage(cv0,l,t,s,s,0,0,518,518);  // areas outside the photo stay flat bg colour
+ const blob=await new Promise(r=>oc.toBlob(r,'image/png'));
+ const xs=[],ys=[];for(let j=0;j<518;j+=2)for(let i=0;i<518;i+=2){const sx=(l+(i+.5)*s/518)|0,sy=(t+(j+.5)*s/518)|0;
+  if(sx>=0&&sy>=0&&sx<w&&sy<h&&A[sy*w+sx]>.5){xs.push(i/518);ys.push(j/518)}}
+ const pc=(v,p)=>{v.sort((a,b)=>a-b);return v.length?v[Math.min(v.length-1,Math.floor(p*v.length))]:null};
+ const mb=xs.length>50?{x0:pc(xs,.01),x1:pc(xs,.99),y0:pc(ys,.01)}:null;
+ // tiny backdrop from the same square crop: background pixels only (person mask dilated), holes push-pull filled
+ const n=48, cell=s/n;
+ const col=new Float32Array(n*n*3),wt=new Float32Array(n*n),dil=Math.max(2,cell*1.5|0);
+ for(let y=0;y<h;y+=2)for(let x=0;x<w;x+=2){const u=((x-l)/cell)|0,v=((y-t)/cell)|0;if(u<0||v<0||u>=n||v>=n)continue;
+  const i=y*w+x;if(hasAlpha||A[i]>.02)continue;const j=v*n+u;wt[j]+=1;for(let k=0;k<3;k++)col[j*3+k]+=img.data[i*4+k]}
+ // cells containing any person pixel (dilated by 1 cell) are holes
+ const hole=new Uint8Array(n*n);
+ for(let y=0;y<h;y+=2)for(let x=0;x<w;x+=2){if(A[y*w+x]<=.3)continue;const u=((x-l)/cell)|0,v=((y-t)/cell)|0;
+  for(let dv=-1;dv<=1;dv++)for(let du=-1;du<=1;du++){const uu=u+du,vv=v+dv;if(uu>=0&&vv>=0&&uu<n&&vv<n)hole[vv*n+uu]=1}}
+ for(let j=0;j<n*n;j++){if(hole[j]||wt[j]<4){wt[j]=0;col[j*3]=col[j*3+1]=col[j*3+2]=0}else{for(let k=0;k<3;k++)col[j*3+k]/=wt[j];wt[j]=1}}
+ let ok=0;for(let j=0;j<n*n;j++)ok+=wt[j];
+ if(ok<n*n*.02){for(let j=0;j<n*n;j++){wt[j]=1;for(let k=0;k<3;k++)col[j*3+k]=bg[k]}}
+ const filled=pushPull(col,wt,n),px=new Uint8Array(n*n*3);
+ for(let j=0;j<n*n*3;j++)px[j]=Math.max(0,Math.min(255,filled[j]));
+const sm=new Float32Array(px.length);let cur=Float32Array.from(px);
+ for(let pass=0;pass<3;pass++){for(let y=0;y<n;y++)for(let x=0;x<n;x++)for(let k=0;k<3;k++){let t=0,cn=0;for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){const xx=x+dx,yy=y+dy;if(xx<0||yy<0||xx>=n||yy>=n)continue;t+=cur[(yy*n+xx)*3+k];cn++}sm[(y*n+x)*3+k]=t/cn}cur=Float32Array.from(sm)}
+ // full-resolution texture of the crop: original pixels everywhere except where the person was (grown mask), which gets the soft fill
+ const R=Math.max(256,Math.min(1024,Math.round(s))),T=new Uint8Array(R*R*3),M=new Float32Array(R*R);
+ for(let j=0;j<R;j++)for(let i=0;i<R;i++){const sx=Math.round(l+(i+.5)*s/R),sy=Math.round(t+(j+.5)*s/R);
+  if(sx>=0&&sy>=0&&sx<w&&sy<h){M[j*R+i]=hasAlpha?1:(A[sy*w+sx]>.1?1:0)}else M[j*R+i]=1}
+ const grow=Math.max(3,R/80|0),tmp=new Float32Array(R*R);
+ for(let j=0;j<R;j++)for(let i=0;i<R;i++){let m=0;for(let d=-grow;d<=grow&&!m;d++){const ii=i+d;if(ii>=0&&ii<R&&M[j*R+ii])m=1}tmp[j*R+i]=m}
+ for(let j=0;j<R;j++)for(let i=0;i<R;i++){let m=0;for(let d=-grow;d<=grow&&!m;d++){const jj=j+d;if(jj>=0&&jj<R&&tmp[jj*R+i])m=1}M[j*R+i]=m}
+ for(let pass=0;pass<2;pass++){for(let j=0;j<R;j++)for(let i=0;i<R;i++){let t2=0,c2=0;for(let d=-grow;d<=grow;d+=2){const ii=i+d;if(ii>=0&&ii<R){t2+=M[j*R+ii];c2++}}tmp[j*R+i]=t2/c2}
+  for(let j=0;j<R;j++)for(let i=0;i<R;i++){let t2=0,c2=0;for(let d=-grow;d<=grow;d+=2){const jj=j+d;if(jj>=0&&jj<R){t2+=tmp[jj*R+i];c2++}}M[j*R+i]=t2/c2}}
+ for(let j=0;j<R;j++)for(let i=0;i<R;i++){
+  const u=Math.max(0,Math.min(n-1.001,(i+.5)/R*n-.5)),v=Math.max(0,Math.min(n-1.001,(j+.5)/R*n-.5)),u0=u|0,v0=v|0,fu=u-u0,fv=v-v0,m=M[j*R+i];
+  const sx=Math.max(0,Math.min(w-1,Math.round(l+(i+.5)*s/R))),sy=Math.max(0,Math.min(h-1,Math.round(t+(j+.5)*s/R)));
+  for(let k=0;k<3;k++){const f=(cur[(v0*n+u0)*3+k]*(1-fu)+cur[(v0*n+u0+1)*3+k]*fu)*(1-fv)+(cur[((v0+1)*n+u0)*3+k]*(1-fu)+cur[((v0+1)*n+u0+1)*3+k]*fu)*fv;
+   const o=hasAlpha?f:img.data[(sy*w+sx)*4+k];T[(j*R+i)*3+k]=m*f+(1-m)*o}}
+ return {blob,mb,bd:{px:T,n:R},preview:oc.toDataURL('image/jpeg',.7),cropped:true}
+}
+let loadTok=0;
+async function load(f){
+ if(!f)return; lastFile=f; const tok=++loadTok;
+ if(f.name.endsWith('.ply')){setSplats(parsePly(await f.arrayBuffer()));return}
+ try{
+  const {blob,bd,preview,cropped,mb}=await prepare(f);
+  if(tok!==loadTok)return;
+  const pv=$('prev');if(preview){pv.src=preview;pv.style.display='block'}else pv.style.display='none';
+  $('status').textContent='reconstructing… (~5s)';
+  const r=await fetch('/reconstruct?refine='+($('refine').checked?1:0)+'&fit='+($('fit').checked?1:0)+'&zoom='+(cropped?1:$('zoom').value),{method:'POST',body:blob});
+  if(!r.ok){$('status').textContent='error: '+r.status+' '+r.statusText;return}
+  const parsed=parsePly(await r.arrayBuffer());
+  if(tok!==loadTok)return;
+  setSplats(parsed); if(bd){setBackdrop(bd.px,bd.n);alignBackdrop(mb)} // head + backdrop swap together
+ }catch(e){console.error(e);$('status').textContent='error: '+(e.message||e)}
+}
+$('file').onchange=e=>load(e.target.files[0]);
+$('fit').onchange=$('refine').onchange=$('zoom').onchange=()=>lastFile&&!lastFile.name.endsWith('.ply')&&load(lastFile);
+addEventListener('dragover',e=>{e.preventDefault();$('drop').style.display='flex'});
+addEventListener('dragleave',e=>{if(!e.relatedTarget)$('drop').style.display='none'});
+addEventListener('drop',e=>{e.preventDefault();$('drop').style.display='none';load(e.dataTransfer.files[0])});
+frame();
+fetch('out.ply').then(r=>r.ok&&r.arrayBuffer()).then(b=>b&&setSplats(parsePly(b))).catch(()=>{});
+</script>

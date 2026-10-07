@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.playwright-mcp/
+.claude/
+.DS_Store
+server.log
+# model weights: download from Hugging Face (see README)
+model/
+# compiled Swift helpers: build from tools/*.swift
+tools/landmarks
+tools/matte
+# generated splats and screenshots
+*.ply
+viewer_v3.png
+# test photos (people / unknown provenance): bring your own
+samples/
