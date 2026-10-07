@@ -19,7 +19,7 @@
  <label>depth (0 = flat) <input type="range" id="depth" min="0" max="6" step="0.01" value="1"></label>
  <label>splat opacity <input type="range" id="sopac" min="0" max="1" step="0.01" value="1"></label>
  <label>mesh opacity <input type="range" id="mopac" min="0" max="1" step="0.01" value="0.6"></label>
- <label>mesh blur <input type="range" id="mblur" min="0" max="8" step="0.1" value="2"></label>
+ <label>mesh blur (px) <input type="range" id="mblur" min="0" max="60" step="0.5" value="8"></label>
  <label>mesh from splat points <input type="checkbox" id="mtri" checked></label>
  <label>edge/back blur <input type="range" id="blur" min="0" max="4" step="0.01" value="0"></label>
  <label>blur reach <input type="range" id="reach" min="0" max="0.99" step="0.01" value="0.7"></label>
@@ -195,16 +195,16 @@ void main(){
  mpos=p; vec4 v=mv*vec4(p,1.); vpos=v.xyz; gl_Position=proj*v;
 }`;
 const mfs=`#version 300 es
-precision highp float; uniform sampler2D col; uniform float mw, fade, mblur, bl;
-uniform vec3 bc, bp; uniform vec2 bq; in vec2 uv; in vec3 vpos, mpos; out vec4 o;
+precision highp float; uniform sampler2D col; uniform float fade;
+uniform vec3 bc, bp; uniform vec2 bq; in vec2 uv; in vec3 vpos, mpos; layout(location=0) out vec4 o; layout(location=1) out vec4 o2;
 void main(){
- // same rim / back-of-head weight as the splat blur (blur reach, edge/back blur sliders), here driving a mip blur of the baked colour+coverage
- float ew=max(smoothstep(bq.x,1.,length(mpos.xy-bc.xy)/bp.x),smoothstep(.1,.6,(bp.y-mpos.z)/bp.z));
- vec4 t=textureLod(col,uv,mblur+bl*ew*3.); if(t.a<.02)discard;
+ vec4 t=texture(col,uv); if(t.a<.02)discard;
  vec3 n=normalize(cross(dFdx(vpos),dFdy(vpos)));
  float f=smoothstep(.0,fade,abs(dot(n,normalize(vpos))));   // fade stretched triangles (depth jumps, grazing surfaces)
- float a=f*smoothstep(0.,.6,t.a)*mw;
- o=vec4(t.rgb/t.a*a,a);
+ float a=f*smoothstep(0.,.6,t.a);
+ // same rim / back-of-head weight as the splat blur; the layer is blurred harder where this is high (see drawMesh)
+ float ew=max(smoothstep(bq.x,1.,length(mpos.xy-bc.xy)/bp.x),smoothstep(.1,.6,(bp.y-mpos.z)/bp.z));
+ o=vec4(t.rgb/t.a*a,a); o2=vec4(ew*a,0.,0.,a);
 }`;
 const pms=gl.createProgram();gl.attachShader(pms,sh(gl.VERTEX_SHADER,mvs));gl.attachShader(pms,sh(gl.FRAGMENT_SHADER,mfs));gl.linkProgram(pms);
 if(!gl.getProgramParameter(pms,gl.LINK_STATUS))throw gl.getProgramInfoLog(pms);
@@ -266,20 +266,70 @@ function bake(){
  for(const t of [bkTex,bkDep]){gl.bindTexture(gl.TEXTURE_2D,t);gl.generateMipmap(gl.TEXTURE_2D)}
  attrs(inst);gl.useProgram(pg);meshReady=true;dirty=true;
 }
-const meshU=P=>{const L=n=>gl.getUniformLocation(P,n);gl.uniform1i(L('col'),5);gl.uniform1f(L('mw'),+$('mopac').value);gl.uniform1f(L('mblur'),+$('mblur').value);gl.uniform1f(L('bl'),+$('blur').value);
+const meshU=P=>{const L=n=>gl.getUniformLocation(P,n);gl.uniform1i(L('col'),5);
  gl.uniform3f(L('bc'),cent[0],cent[1],cent[2]);gl.uniform3f(L('bp'),bst.rmax,bst.zf,Math.max(bst.zf-bst.zmin,1e-3));gl.uniform2f(L('bq'),+$('reach').value,radius)};
+// The mesh is drawn into its own half-res layer (colour + rim weight), Gaussian-blurred in screen space, then composited under the splats.
+const qvs=`#version 300 es
+out vec2 q; void main(){vec2 p=vec2(float(gl_VertexID&1),float(gl_VertexID>>1)); q=p; gl_Position=vec4(p*2.-1.,0.,1.);}`;
+const blfs=`#version 300 es
+precision highp float; in vec2 q; uniform sampler2D t0,t1; uniform vec2 step_; layout(location=0) out vec4 o0; layout(location=1) out vec4 o1;
+void main(){ vec4 a=vec4(0),b=vec4(0); float ws=0.;
+ for(int i=-16;i<=16;i++){float x=float(i)/5.333, w=exp(-.5*x*x); vec2 u=q+step_*float(i); a+=texture(t0,u)*w; b+=texture(t1,u)*w; ws+=w;}
+ o0=a/ws; o1=b/ws; }`;
+const cpfs=`#version 300 es
+precision highp float; in vec2 q; uniform sampler2D c0,c1,e0; uniform float mw; out vec4 o;
+void main(){ vec4 c=texture(c0,q), w=texture(c1,q), e=texture(e0,q);
+ float ew=w.r/max(w.a,1e-3);                      // blurred rim weight: 0 = face (base blur), 1 = rim/back (strong blur)
+ o=mix(c,e,smoothstep(0.,.8,ew))*mw; }`;
+const mkq=(f)=>{const P=gl.createProgram();gl.attachShader(P,sh(gl.VERTEX_SHADER,qvs));gl.attachShader(P,sh(gl.FRAGMENT_SHADER,f));gl.linkProgram(P);if(!gl.getProgramParameter(P,gl.LINK_STATUS))throw gl.getProgramInfoLog(P);return P};
+const pbl=mkq(blfs), pcp=mkq(cpfs);
+let mrt=null;
+function ensureMRT(w,h){
+ if(mrt&&mrt.w===w&&mrt.h===h)return mrt;
+ if(mrt){mrt.tex.forEach(t=>gl.deleteTexture(t));mrt.fb.forEach(f=>gl.deleteFramebuffer(f));gl.deleteRenderbuffer(mrt.rb)}
+ const tex=[],fb=[];
+ const mk=()=>{const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);gl.texStorage2D(gl.TEXTURE_2D,1,gl.RGBA16F,w,h);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);tex.push(t);return t};
+ const rb=gl.createRenderbuffer();gl.bindRenderbuffer(gl.RENDERBUFFER,rb);gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT16,w,h);
+ for(let k=0;k<5;k++){const f=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,f);   // A: mesh, B/C: base blur, D/E: strong blur
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,mk(),0);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT1,gl.TEXTURE_2D,mk(),0);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0,gl.COLOR_ATTACHMENT1]);if(k===0)gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,rb);fb.push(f)}
+ gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+ return mrt={w,h,tex,fb,rb};
+}
+function blurPass(srcI,dstFb,px,horiz,w,h){ // textures of fb srcI (2 each) -> dstFb
+ gl.bindFramebuffer(gl.FRAMEBUFFER,dstFb);gl.useProgram(pbl);
+ gl.activeTexture(gl.TEXTURE6);gl.bindTexture(gl.TEXTURE_2D,mrt.tex[srcI*2]);gl.activeTexture(gl.TEXTURE7);gl.bindTexture(gl.TEXTURE_2D,mrt.tex[srcI*2+1]);gl.activeTexture(gl.TEXTURE0);
+ const L=n=>gl.getUniformLocation(pbl,n),st=px/5.333;gl.uniform1i(L('t0'),6);gl.uniform1i(L('t1'),7);gl.uniform2f(L('step_'),horiz?st/w:0,horiz?0:st/h);
+ gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+}
 function drawMesh(mv,proj,mb){
  if(!meshReady||mb<=0)return;
- gl.useProgram(pms);const L=n=>gl.getUniformLocation(pms,n);
+ const W=gl.drawingBufferWidth,H=gl.drawingBufferHeight,lw=Math.max(2,W>>1),lh=Math.max(2,H>>1),R=ensureMRT(lw,lh);
+ // 1. mesh -> layer A
+ gl.bindFramebuffer(gl.FRAMEBUFFER,R.fb[0]);gl.viewport(0,0,lw,lh);
+ gl.clearBufferfv(gl.COLOR,0,[0,0,0,0]);gl.clearBufferfv(gl.COLOR,1,[0,0,0,0]);gl.clearBufferfv(gl.DEPTH,0,[1]);
  gl.activeTexture(gl.TEXTURE4);gl.bindTexture(gl.TEXTURE_2D,bkDep);gl.activeTexture(gl.TEXTURE5);gl.bindTexture(gl.TEXTURE_2D,bkTex);gl.activeTexture(gl.TEXTURE0);
- gl.uniform1i(L('dep'),4);gl.uniform1f(L('fade'),.15);meshU(pms);
- gl.uniformMatrix4fv(L('mv'),false,mv);gl.uniformMatrix4fv(L('proj'),false,proj);
- gl.uniform3f(L('mc'),cent[0],cent[1],cent[2]);gl.uniform4f(L('mp'),radius*DISTK,Math.tan(FOV/2),bst.zf,+$('depth').value);gl.uniform1f(L('G'),GRID);
  gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);
  if($('mtri').checked&&faces&&tv){gl.useProgram(ptr);const T=n=>gl.getUniformLocation(ptr,n);gl.uniformMatrix4fv(T('mv'),false,mv);gl.uniformMatrix4fv(T('proj'),false,proj);
   meshU(ptr);gl.uniform1f(T('fade'),window.FADE??.01);gl.bindVertexArray(tvao);gl.drawElements(gl.TRIANGLES,faces.length,gl.UNSIGNED_INT,0);gl.bindVertexArray(null)}
- else gl.drawArrays(gl.TRIANGLES,0,(GRID-1)*(GRID-1)*6);
- gl.disable(gl.DEPTH_TEST);gl.useProgram(pg);
+ else{gl.useProgram(pms);const L=n=>gl.getUniformLocation(pms,n);
+  gl.uniform1i(L('dep'),4);gl.uniform1f(L('fade'),.15);meshU(pms);gl.uniformMatrix4fv(L('mv'),false,mv);gl.uniformMatrix4fv(L('proj'),false,proj);
+  gl.uniform3f(L('mc'),cent[0],cent[1],cent[2]);gl.uniform4f(L('mp'),radius*DISTK,Math.tan(FOV/2),bst.zf,+$('depth').value);gl.uniform1f(L('G'),GRID);
+  gl.drawArrays(gl.TRIANGLES,0,(GRID-1)*(GRID-1)*6)}
+ gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);
+ // 2. Gaussian blur: A -> B -> C (base, screen px), and C -> D -> E (base + rim extra) for the rim / back of the head
+ const sb=Math.max(+$('mblur').value/2,.01), se=sb+(+$('blur').value)*15;
+ blurPass(0,R.fb[1],sb,true,lw,lh);blurPass(1,R.fb[2],sb,false,lw,lh);
+ const strong=se>sb+.5; if(strong){blurPass(2,R.fb[3],se,true,lw,lh);blurPass(3,R.fb[4],se,false,lw,lh)}
+ // 3. composite under the splats
+ gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,W,H);gl.useProgram(pcp);
+ gl.activeTexture(gl.TEXTURE6);gl.bindTexture(gl.TEXTURE_2D,R.tex[4]);gl.activeTexture(gl.TEXTURE7);gl.bindTexture(gl.TEXTURE_2D,R.tex[5]);
+ gl.activeTexture(gl.TEXTURE8);gl.bindTexture(gl.TEXTURE_2D,R.tex[strong?8:4]);gl.activeTexture(gl.TEXTURE0);
+ const L=n=>gl.getUniformLocation(pcp,n);gl.uniform1i(L('c0'),6);gl.uniform1i(L('c1'),7);gl.uniform1i(L('e0'),8);gl.uniform1f(L('mw'),mb);
+ gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+ gl.useProgram(pg);
 }
 
 // ---- backdrop: tiny low-res fill of the background, drawn behind the splats with parallax ----
