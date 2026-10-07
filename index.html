@@ -17,7 +17,9 @@
  <label>model scale <input type="range" id="mscale" min="1" max="12" step="0.1" value="1"></label>
  <label>max yaw° <input type="range" id="maxyaw" min="5" max="180" step="1" value="30"></label>
  <label>depth (0 = flat) <input type="range" id="depth" min="0" max="6" step="0.01" value="1"></label>
- <label>mesh blend <input type="range" id="mblend" min="0" max="1" step="0.01" value="0.5"></label>
+ <label>splat opacity <input type="range" id="sopac" min="0" max="1" step="0.01" value="1"></label>
+ <label>mesh opacity <input type="range" id="mopac" min="0" max="1" step="0.01" value="0.6"></label>
+ <label>mesh blur <input type="range" id="mblur" min="0" max="8" step="0.1" value="2"></label>
  <label>mesh from splat points <input type="checkbox" id="mtri" checked></label>
  <label>edge/back blur <input type="range" id="blur" min="0" max="4" step="0.01" value="0"></label>
  <label>blur reach <input type="range" id="reach" min="0" max="0.99" step="0.01" value="0.7"></label>
@@ -153,14 +155,14 @@ function frame(){
  const model=mul(rotX(pitch),mul(rotY(yaw),mul(scaleM(ms,ms*fy,ms*fz),trans(-cent[0],-cent[1],-cent[2]))));
  const mv=mul(trans(0,0,-dist),model), proj=persp(FOV,w/h,.01,100);
  drawPlane(mv,proj,dist/ms);
- const mb=+$('mblend').value; drawMesh(mv,proj,mb);
+ const mb=+$('mopac').value; drawMesh(mv,proj,mb);
  // sort back-to-front by view z
  const d=new Float32Array(N);for(let i=0;i<N;i++){const o=i*14;d[i]=mv[2]*data[o]+mv[6]*data[o+1]+mv[10]*data[o+2]}
  order.sort((a,b)=>d[a]-d[b]);
  for(let j=0;j<N;j++)sorted.set(data.subarray(order[j]*14,order[j]*14+14),j*14);
  gl.bindBuffer(gl.ARRAY_BUFFER,inst);gl.bufferSubData(gl.ARRAY_BUFFER,0,sorted);
  gl.uniformMatrix4fv(U('mv'),false,mv);gl.uniformMatrix4fv(U('proj'),false,proj);gl.uniform2f(U('vp'),w,h);gl.uniform1f(U('sz'),+$('size').value);
- gl.uniform3f(U('bc'),cent[0],cent[1],cent[2]);gl.uniform3f(U('bp'),bst.rmax,bst.zf,Math.max(bst.zf-bst.zmin,1e-3));gl.uniform2f(U('bq'),+$('reach').value,radius);gl.uniform1f(U('bl'),+$('blur').value);gl.uniform1f(U('uso'),1-mb);
+ gl.uniform3f(U('bc'),cent[0],cent[1],cent[2]);gl.uniform3f(U('bp'),bst.rmax,bst.zf,Math.max(bst.zf-bst.zmin,1e-3));gl.uniform2f(U('bq'),+$('reach').value,radius);gl.uniform1f(U('bl'),+$('blur').value);gl.uniform1f(U('uso'),+$('sopac').value);
  // scale applied in model matrix -> gaussian scales scale with it via mat3(mv)
  gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,N);
 }
@@ -179,7 +181,7 @@ if(!gl.getProgramParameter(pbk,gl.LINK_STATUS))throw gl.getProgramInfoLog(pbk);
 const mvs=`#version 300 es
 precision highp float;
 uniform mat4 mv,proj; uniform sampler2D dep; uniform vec3 mc; uniform vec4 mp; uniform float G; // mp = (camera dist, tan(fov/2), face-surface z, depth scale)
-out vec2 uv; out vec3 vpos;
+out vec2 uv; out vec3 vpos, mpos;
 const ivec2 cc[6]=ivec2[6](ivec2(0,0),ivec2(1,0),ivec2(0,1),ivec2(1,0),ivec2(1,1),ivec2(0,1));
 void main(){
  int n=int(G)-1, q=gl_VertexID/6;
@@ -190,15 +192,18 @@ void main(){
  float z2=mp.z+(D-mp.z)*mp.w, zc=z2-mc.z;      // depth scale about the face surface...
  vec2 nd=uv*2.-1.;                             // ...keeping the frontal picture: xy follows the camera ray at the new depth
  vec3 p=vec3(mc.xy+nd*mp.y*(mp.x-zc),z2);
- vec4 v=mv*vec4(p,1.); vpos=v.xyz; gl_Position=proj*v;
+ mpos=p; vec4 v=mv*vec4(p,1.); vpos=v.xyz; gl_Position=proj*v;
 }`;
 const mfs=`#version 300 es
-precision highp float; uniform sampler2D col; uniform float mw, fade; in vec2 uv; in vec3 vpos; out vec4 o;
+precision highp float; uniform sampler2D col; uniform float mw, fade, mblur, bl;
+uniform vec3 bc, bp; uniform vec2 bq; in vec2 uv; in vec3 vpos, mpos; out vec4 o;
 void main(){
- vec4 t=texture(col,uv); if(t.a<.02)discard;
+ // same rim / back-of-head weight as the splat blur (blur reach, edge/back blur sliders), here driving a mip blur of the baked colour+coverage
+ float ew=max(smoothstep(bq.x,1.,length(mpos.xy-bc.xy)/bp.x),smoothstep(.1,.6,(bp.y-mpos.z)/bp.z));
+ vec4 t=textureLod(col,uv,mblur+bl*ew*3.); if(t.a<.02)discard;
  vec3 n=normalize(cross(dFdx(vpos),dFdy(vpos)));
  float f=smoothstep(.0,fade,abs(dot(n,normalize(vpos))));   // fade stretched triangles (depth jumps, grazing surfaces)
- float a=f*smoothstep(0.,.6,t.a)*min(1.,mw*10.);
+ float a=f*smoothstep(0.,.6,t.a)*mw;
  o=vec4(t.rgb/t.a*a,a);
 }`;
 const pms=gl.createProgram();gl.attachShader(pms,sh(gl.VERTEX_SHADER,mvs));gl.attachShader(pms,sh(gl.FRAGMENT_SHADER,mfs));gl.linkProgram(pms);
@@ -207,8 +212,8 @@ if(!gl.getProgramParameter(pms,gl.LINK_STATUS))throw gl.getProgramInfoLog(pms);
 let faces=null;
 fetch('faces.bin').then(r=>r.ok&&r.arrayBuffer()).then(b=>{if(b){faces=new Uint32Array(b);meshBuf();updateMesh()}}).catch(()=>{});
 const tvs=`#version 300 es
-precision highp float; uniform mat4 mv,proj; in vec3 pos; in vec2 tuv; out vec2 uv; out vec3 vpos;
-void main(){ uv=tuv; vec4 v=mv*vec4(pos,1.); vpos=v.xyz; gl_Position=proj*v; }`;
+precision highp float; uniform mat4 mv,proj; in vec3 pos; in vec2 tuv; out vec2 uv; out vec3 vpos, mpos;
+void main(){ uv=tuv; mpos=pos; vec4 v=mv*vec4(pos,1.); vpos=v.xyz; gl_Position=proj*v; }`;
 const ptr=gl.createProgram();gl.attachShader(ptr,sh(gl.VERTEX_SHADER,tvs));gl.attachShader(ptr,sh(gl.FRAGMENT_SHADER,mfs));gl.bindAttribLocation(ptr,0,'pos');gl.bindAttribLocation(ptr,1,'tuv');gl.linkProgram(ptr);
 if(!gl.getProgramParameter(ptr,gl.LINK_STATUS))throw gl.getProgramInfoLog(ptr);
 const tvao=gl.createVertexArray(), tvb=gl.createBuffer(), tib=gl.createBuffer(); let tv=null, nbr=null;
@@ -261,16 +266,18 @@ function bake(){
  for(const t of [bkTex,bkDep]){gl.bindTexture(gl.TEXTURE_2D,t);gl.generateMipmap(gl.TEXTURE_2D)}
  attrs(inst);gl.useProgram(pg);meshReady=true;dirty=true;
 }
+const meshU=P=>{const L=n=>gl.getUniformLocation(P,n);gl.uniform1i(L('col'),5);gl.uniform1f(L('mw'),+$('mopac').value);gl.uniform1f(L('mblur'),+$('mblur').value);gl.uniform1f(L('bl'),+$('blur').value);
+ gl.uniform3f(L('bc'),cent[0],cent[1],cent[2]);gl.uniform3f(L('bp'),bst.rmax,bst.zf,Math.max(bst.zf-bst.zmin,1e-3));gl.uniform2f(L('bq'),+$('reach').value,radius)};
 function drawMesh(mv,proj,mb){
  if(!meshReady||mb<=0)return;
  gl.useProgram(pms);const L=n=>gl.getUniformLocation(pms,n);
  gl.activeTexture(gl.TEXTURE4);gl.bindTexture(gl.TEXTURE_2D,bkDep);gl.activeTexture(gl.TEXTURE5);gl.bindTexture(gl.TEXTURE_2D,bkTex);gl.activeTexture(gl.TEXTURE0);
- gl.uniform1i(L('dep'),4);gl.uniform1f(L('fade'),.15);gl.uniform1i(L('col'),5);
+ gl.uniform1i(L('dep'),4);gl.uniform1f(L('fade'),.15);meshU(pms);
  gl.uniformMatrix4fv(L('mv'),false,mv);gl.uniformMatrix4fv(L('proj'),false,proj);
- gl.uniform3f(L('mc'),cent[0],cent[1],cent[2]);gl.uniform4f(L('mp'),radius*DISTK,Math.tan(FOV/2),bst.zf,+$('depth').value);gl.uniform1f(L('G'),GRID);gl.uniform1f(L('mw'),mb);
+ gl.uniform3f(L('mc'),cent[0],cent[1],cent[2]);gl.uniform4f(L('mp'),radius*DISTK,Math.tan(FOV/2),bst.zf,+$('depth').value);gl.uniform1f(L('G'),GRID);
  gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);
  if($('mtri').checked&&faces&&tv){gl.useProgram(ptr);const T=n=>gl.getUniformLocation(ptr,n);gl.uniformMatrix4fv(T('mv'),false,mv);gl.uniformMatrix4fv(T('proj'),false,proj);
-  gl.uniform1i(T('col'),5);gl.uniform1f(T('mw'),mb);gl.uniform1f(T('fade'),window.FADE??.01);gl.bindVertexArray(tvao);gl.drawElements(gl.TRIANGLES,faces.length,gl.UNSIGNED_INT,0);gl.bindVertexArray(null)}
+  meshU(ptr);gl.uniform1f(T('fade'),window.FADE??.01);gl.bindVertexArray(tvao);gl.drawElements(gl.TRIANGLES,faces.length,gl.UNSIGNED_INT,0);gl.bindVertexArray(null)}
  else gl.drawArrays(gl.TRIANGLES,0,(GRID-1)*(GRID-1)*6);
  gl.disable(gl.DEPTH_TEST);gl.useProgram(pg);
 }
