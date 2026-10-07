@@ -18,6 +18,7 @@
  <label>max yaw° <input type="range" id="maxyaw" min="5" max="180" step="1" value="30"></label>
  <label>depth (0 = flat) <input type="range" id="depth" min="0" max="6" step="0.01" value="1"></label>
  <label>mesh blend <input type="range" id="mblend" min="0" max="1" step="0.01" value="0.5"></label>
+ <label>mesh from splat points <input type="checkbox" id="mtri" checked></label>
  <label>edge/back blur <input type="range" id="blur" min="0" max="4" step="0.01" value="0"></label>
  <label>blur reach <input type="range" id="reach" min="0" max="0.99" step="0.01" value="0.7"></label>
  <label>flip Y <input type="checkbox" id="fy"></label>
@@ -112,7 +113,7 @@ function applySquash(){ // live version of unflare's squash: scale depth behind 
   if(k!==1){const z2=zf+(z-zf)*k;r=Math.max(d1-(z2-cent[2]),1e-3)/Math.max(d1-(z-cent[2]),1e-3);z=z2}
   data[o]=cent[0]+(base[o]-cent[0])*r;data[o+1]=cent[1]+(base[o+1]-cent[1])*r;data[o+2]=z;
   data[o+3]=base[o+3]*r;data[o+4]=base[o+4]*r;data[o+5]=base[o+5]*r}
- dirty=true;
+ updateMesh();dirty=true;
 }
 $('depth').addEventListener('input',applySquash);
 function setSplats({n,out}){
@@ -192,16 +193,48 @@ void main(){
  vec4 v=mv*vec4(p,1.); vpos=v.xyz; gl_Position=proj*v;
 }`;
 const mfs=`#version 300 es
-precision highp float; uniform sampler2D col; uniform float mw; in vec2 uv; in vec3 vpos; out vec4 o;
+precision highp float; uniform sampler2D col; uniform float mw, fade; in vec2 uv; in vec3 vpos; out vec4 o;
 void main(){
  vec4 t=texture(col,uv); if(t.a<.02)discard;
  vec3 n=normalize(cross(dFdx(vpos),dFdy(vpos)));
- float f=smoothstep(.02,.15,abs(dot(n,normalize(vpos))));   // fade stretched triangles (depth jumps, grazing surfaces)
+ float f=smoothstep(.0,fade,abs(dot(n,normalize(vpos))));   // fade stretched triangles (depth jumps, grazing surfaces)
  float a=f*smoothstep(0.,.6,t.a)*min(1.,mw*10.);
  o=vec4(t.rgb/t.a*a,a);
 }`;
 const pms=gl.createProgram();gl.attachShader(pms,sh(gl.VERTEX_SHADER,mvs));gl.attachShader(pms,sh(gl.FRAGMENT_SHADER,mfs));gl.linkProgram(pms);
 if(!gl.getProgramParameter(pms,gl.LINK_STATUS))throw gl.getProgramInfoLog(pms);
+// triangulated splat centres (topology from faces.bin = one-off Delaunay of LAM's canonical grid, see tools/make_faces.py)
+let faces=null;
+fetch('faces.bin').then(r=>r.ok&&r.arrayBuffer()).then(b=>{if(b){faces=new Uint32Array(b);meshBuf();updateMesh()}}).catch(()=>{});
+const tvs=`#version 300 es
+precision highp float; uniform mat4 mv,proj; in vec3 pos; in vec2 tuv; out vec2 uv; out vec3 vpos;
+void main(){ uv=tuv; vec4 v=mv*vec4(pos,1.); vpos=v.xyz; gl_Position=proj*v; }`;
+const ptr=gl.createProgram();gl.attachShader(ptr,sh(gl.VERTEX_SHADER,tvs));gl.attachShader(ptr,sh(gl.FRAGMENT_SHADER,mfs));gl.bindAttribLocation(ptr,0,'pos');gl.bindAttribLocation(ptr,1,'tuv');gl.linkProgram(ptr);
+if(!gl.getProgramParameter(ptr,gl.LINK_STATUS))throw gl.getProgramInfoLog(ptr);
+const tvao=gl.createVertexArray(), tvb=gl.createBuffer(), tib=gl.createBuffer(); let tv=null, nbr=null;
+function meshBuf(){gl.bindVertexArray(tvao);gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,tib);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,faces,gl.STATIC_DRAW);
+ gl.bindBuffer(gl.ARRAY_BUFFER,tvb);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,20,0);gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,2,gl.FLOAT,false,20,12);gl.bindVertexArray(null)}
+function adjacency(){const sets=Array.from({length:N},()=>new Set());for(let f=0;f<faces.length;f+=3)for(let k=0;k<3;k++){const a=faces[f+k],b=faces[f+(k+1)%3];sets[a].add(b);sets[b].add(a)}
+ const off=new Uint32Array(N+1);sets.forEach((x,i)=>off[i+1]=off[i]+x.size);const idx=new Uint32Array(off[N]);sets.forEach((x,i)=>idx.set([...x],off[i]));nbr={off,idx}}
+// The splat cloud is layered (eyes, lips, lashes, hair float over skin), so xy-neighbours are not surface neighbours. Replace each vertex's
+// depth by the median of itself and its neighbours (repeated): layers collapse onto one surface, no triangles need deleting, so no holes.
+function medianDepth(it,z0){
+ if(!nbr||nbr.off.length!==N+1)adjacency();const {off,idx}=nbr;let a=z0,b=new Float32Array(N),w=[];
+ for(let r=0;r<it;r++){for(let i=0;i<N;i++){w.length=0;w.push(a[i]);for(let k=off[i];k<off[i+1];k++)if(base[idx[k]*14+13]>.15)w.push(a[idx[k]]);w.sort((x,y)=>x-y);b[i]=w[w.length>>1]}[a,b]=[b,a]}
+ return a}
+let zmCache=null,zmBase=null;
+function updateMesh(){ // positions follow the depth-scaled splats; texture coords are fixed to the frontal bake, so colour sticks to each vertex
+ if(!faces||!data||!base||data.length/14!==N)return;
+ if(!tv||tv.length!==N*5)tv=new Float32Array(N*5);
+ const T=Math.tan(FOV/2),d1=bst.d1,kd=+$('depth').value,zf=bst.zf,z0=new Float32Array(N);
+ for(let i=0;i<N;i++)z0[i]=base[i*14+2];
+ if(zmBase!==base){zmCache=medianDepth(window.MED??4,z0);zmBase=base}const zm=zmCache; // median depth only changes with a new photo
+ for(let i=0;i<N;i++){const o=i*14,j=i*5,zb=zm[i],z2=zf+(zb-zf)*kd,dz=d1-(zb-cent[2]),dz2=d1-(z2-cent[2]);
+  // frontal picture preserved: xy from the bake ray at the new depth
+  const nx=(base[o]-cent[0])/(T*dz),ny=(base[o+1]-cent[1])/(T*dz);
+  tv[j]=cent[0]+nx*T*dz2;tv[j+1]=cent[1]+ny*T*dz2;tv[j+2]=z2;tv[j+3]=.5+.5*nx;tv[j+4]=.5+.5*ny}
+ gl.bindBuffer(gl.ARRAY_BUFFER,tvb);gl.bufferData(gl.ARRAY_BUFFER,tv,gl.DYNAMIC_DRAW);
+}
 function bake(){
  meshReady=false;
  if(!gl.getExtension('EXT_color_buffer_float')||!base)return;
@@ -232,11 +265,13 @@ function drawMesh(mv,proj,mb){
  if(!meshReady||mb<=0)return;
  gl.useProgram(pms);const L=n=>gl.getUniformLocation(pms,n);
  gl.activeTexture(gl.TEXTURE4);gl.bindTexture(gl.TEXTURE_2D,bkDep);gl.activeTexture(gl.TEXTURE5);gl.bindTexture(gl.TEXTURE_2D,bkTex);gl.activeTexture(gl.TEXTURE0);
- gl.uniform1i(L('dep'),4);gl.uniform1i(L('col'),5);
+ gl.uniform1i(L('dep'),4);gl.uniform1f(L('fade'),.15);gl.uniform1i(L('col'),5);
  gl.uniformMatrix4fv(L('mv'),false,mv);gl.uniformMatrix4fv(L('proj'),false,proj);
  gl.uniform3f(L('mc'),cent[0],cent[1],cent[2]);gl.uniform4f(L('mp'),radius*DISTK,Math.tan(FOV/2),bst.zf,+$('depth').value);gl.uniform1f(L('G'),GRID);gl.uniform1f(L('mw'),mb);
  gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);
- gl.drawArrays(gl.TRIANGLES,0,(GRID-1)*(GRID-1)*6);
+ if($('mtri').checked&&faces&&tv){gl.useProgram(ptr);const T=n=>gl.getUniformLocation(ptr,n);gl.uniformMatrix4fv(T('mv'),false,mv);gl.uniformMatrix4fv(T('proj'),false,proj);
+  gl.uniform1i(T('col'),5);gl.uniform1f(T('mw'),mb);gl.uniform1f(T('fade'),window.FADE??.01);gl.bindVertexArray(tvao);gl.drawElements(gl.TRIANGLES,faces.length,gl.UNSIGNED_INT,0);gl.bindVertexArray(null)}
+ else gl.drawArrays(gl.TRIANGLES,0,(GRID-1)*(GRID-1)*6);
  gl.disable(gl.DEPTH_TEST);gl.useProgram(pg);
 }
 
