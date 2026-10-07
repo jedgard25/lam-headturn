@@ -13,23 +13,23 @@
  <b>Drop a headshot (jpg/png) or a .ply</b>
  <input type="file" id="file" accept="image/*,.ply">
  <label>zoom <input type="range" id="zoom" min="0.5" max="4" step="0.05" value="1"></label>
- <label>splat size <input type="range" id="size" min="0.1" max="12" step="0.1" value="1"></label>
+ <label>splat size <input type="range" id="size" min="0.1" max="12" step="0.1" value="1.1"></label>
  <label>model scale <input type="range" id="mscale" min="1" max="12" step="0.1" value="1"></label>
- <label>max yaw° <input type="range" id="maxyaw" min="5" max="180" step="1" value="30"></label>
- <label>depth (0 = flat) <input type="range" id="depth" min="0" max="6" step="0.01" value="1"></label>
+ <label>max yaw° <input type="range" id="maxyaw" min="5" max="180" step="1" value="27"></label>
+ <label>depth (0 = flat) <input type="range" id="depth" min="0" max="6" step="0.01" value="1.6"></label>
  <label>splat opacity <input type="range" id="sopac" min="0" max="1" step="0.01" value="1"></label>
- <label>mesh opacity <input type="range" id="mopac" min="0" max="1" step="0.01" value="0.6"></label>
- <label>mesh blur (px) <input type="range" id="mblur" min="0" max="60" step="0.5" value="8"></label>
- <label>mesh from splat points <input type="checkbox" id="mtri" checked></label>
+ <label>mesh opacity <input type="range" id="mopac" min="0" max="1" step="0.01" value="1"></label>
+ <label>mesh blur (px) <input type="range" id="mblur" min="0" max="60" step="0.5" value="5.5"></label>
+ <label>mesh from splat points <input type="checkbox" id="mtri"></label>
  <label>edge/back blur <input type="range" id="blur" min="0" max="4" step="0.01" value="0"></label>
- <label>blur reach <input type="range" id="reach" min="0" max="0.99" step="0.01" value="0.7"></label>
+ <label>blur reach <input type="range" id="reach" min="0" max="0.99" step="0.01" value="0.49"></label>
  <label>flip Y <input type="checkbox" id="fy"></label>
  <label>flip Z <input type="checkbox" id="fz"></label>
  <label>cutout first (Apple Vision) <input type="checkbox" id="matte" checked></label>
  <label>depth refine (landmarks+depth) <input type="checkbox" id="refine" checked></label>
  <label>photo fit (slower, sharper) <input type="checkbox" id="fit" checked></label>
- <label>backdrop <input type="checkbox" id="bd" checked></label>
- <label>parallax depth <input type="range" id="par" min="-4" max="4" step="0.1" value="1.5"></label>
+ <label>backdrop <input type="checkbox" id="bd"></label>
+ <label>parallax depth <input type="range" id="par" min="-4" max="4" step="0.1" value="0.7"></label>
  <label>backdrop scale <input type="range" id="bscale" min="0.5" max="2.5" step="0.05" value="1"></label>
  <img id="prev" style="width:100%;border-radius:4px;display:none">
  <label>cursor follow <input type="checkbox" id="follow" checked></label>
