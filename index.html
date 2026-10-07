@@ -17,6 +17,7 @@
  <label>model scale <input type="range" id="mscale" min="1" max="12" step="0.1" value="1"></label>
  <label>max yaw° <input type="range" id="maxyaw" min="5" max="180" step="1" value="30"></label>
  <label>depth (0 = flat) <input type="range" id="depth" min="0" max="6" step="0.01" value="1"></label>
+ <label>mesh blend <input type="range" id="mblend" min="0" max="1" step="0.01" value="0.5"></label>
  <label>edge/back blur <input type="range" id="blur" min="0" max="4" step="0.01" value="0"></label>
  <label>blur reach <input type="range" id="reach" min="0" max="0.99" step="0.01" value="0.7"></label>
  <label>flip Y <input type="checkbox" id="fy"></label>
@@ -38,7 +39,7 @@ const vs=`#version 300 es
 in vec2 corner; in vec3 ctr; in vec3 scl; in vec4 rot; in vec4 col;
 uniform mat4 mv, proj; uniform vec2 vp; uniform float sz;
 uniform vec3 bc; uniform vec3 bp; uniform vec2 bq; uniform float bl; // blur: bc=centre, bp=(rmax,zface,zspan), bq=(reach,radius), bl=amount
-out vec4 vcol; out vec2 vpos;
+out vec4 vcol; out vec2 vpos; out float vz;
 void main(){
  vec4 c4=mv*vec4(ctr,1.); vec3 t=c4.xyz;
  if(t.z>-0.01){gl_Position=vec4(2,2,2,1);return;}
@@ -65,11 +66,11 @@ void main(){
  vec2 off=(corner.x*sqrt(l1)*e1+corner.y*sqrt(l2)*e2)*3.*sz;
  vec4 p=proj*c4;
  gl_Position=vec4(p.xy/p.w+off*2./vp, p.z/p.w,1.);
- vcol=vec4(col.rgb,col.a*ba); vpos=corner*3.;
+ vz=ctr.z; vcol=vec4(col.rgb,col.a*ba); vpos=corner*3.;
 }`;
 const fs=`#version 300 es
-precision highp float; in vec4 vcol; in vec2 vpos; out vec4 o;
-void main(){ float r=dot(vpos,vpos); if(r>9.)discard; float a=exp(-.5*r)*vcol.a; o=vec4(vcol.rgb*a,a);}`;
+precision highp float; in vec4 vcol; in vec2 vpos; out vec4 o; uniform float uso; // uso: splat opacity multiplier (1 - mesh blend)
+void main(){ float r=dot(vpos,vpos); if(r>9.)discard; float a=exp(-.5*r)*vcol.a*uso; o=vec4(vcol.rgb*a,a);}`;
 function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(o);return o}
 const pg=gl.createProgram();gl.attachShader(pg,sh(gl.VERTEX_SHADER,vs));gl.attachShader(pg,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(pg);
 if(!gl.getProgramParameter(pg,gl.LINK_STATUS))throw gl.getProgramInfoLog(pg);
@@ -78,8 +79,9 @@ const U=n=>gl.getUniformLocation(pg,n), A=n=>gl.getAttribLocation(pg,n);
 const quad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
 gl.enableVertexAttribArray(A('corner'));gl.vertexAttribPointer(A('corner'),2,gl.FLOAT,false,0,0);
 const inst=gl.createBuffer(); const STRIDE=14*4; let N=0, data=null, cent=[0,0,0], radius=1;
-gl.bindBuffer(gl.ARRAY_BUFFER,inst);
-['ctr:3:0','scl:3:3','rot:4:6','col:4:10'].forEach(s=>{const [n,k,o]=s.split(':');const l=A(n);gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,+k,gl.FLOAT,false,STRIDE,+o*4);gl.vertexAttribDivisor(l,1)});
+const attrs=buf=>{gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+['ctr:3:0','scl:3:3','rot:4:6','col:4:10'].forEach(s=>{const [n,k,o]=s.split(':');const l=A(n);gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,+k,gl.FLOAT,false,STRIDE,+o*4);gl.vertexAttribDivisor(l,1)})};
+attrs(inst);
 gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
 
 function parsePly(buf){
@@ -119,6 +121,7 @@ function setSplats({n,out}){
  base=out.slice();prep();applySquash();
  order=new Uint32Array(n).map((_,i)=>i);
  sorted=new Float32Array(n*14);gl.bindBuffer(gl.ARRAY_BUFFER,inst);gl.bufferData(gl.ARRAY_BUFFER,sorted.byteLength,gl.DYNAMIC_DRAW);
+ bake();
  $('status').textContent=`${n} gaussians, radius≈${radius.toFixed(3)}`;
 }
 let order,sorted,dirty=true,lastW=0,lastH=0; // dirty = something changed -> redraw; idle frames are skipped so the GPU/fans can rest
@@ -142,22 +145,99 @@ function frame(){
  const moving=yaw!==tgtYaw||pitch!==tgtPitch||yaw!==lastYaw||pitch!==lastPitch;
  if(!moving&&!dirty&&w===lastW&&h===lastH)return;  // idle: leave the last frame on screen (clearing here would blank it)
  dirty=false;lastW=w;lastH=h;lastYaw=yaw;lastPitch=pitch;
- gl.viewport(0,0,w,h);gl.clearColor(.07,.07,.07,1);gl.clear(gl.COLOR_BUFFER_BIT);
+ gl.viewport(0,0,w,h);gl.clearColor(.07,.07,.07,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
  if(!N)return;
  const ms=+$('mscale').value, fy=$('fy').checked?-1:1, fz=$('fz').checked?-1:1;
  const dist=radius*ms*DISTK;
  const model=mul(rotX(pitch),mul(rotY(yaw),mul(scaleM(ms,ms*fy,ms*fz),trans(-cent[0],-cent[1],-cent[2]))));
  const mv=mul(trans(0,0,-dist),model), proj=persp(FOV,w/h,.01,100);
  drawPlane(mv,proj,dist/ms);
+ const mb=+$('mblend').value; drawMesh(mv,proj,mb);
  // sort back-to-front by view z
  const d=new Float32Array(N);for(let i=0;i<N;i++){const o=i*14;d[i]=mv[2]*data[o]+mv[6]*data[o+1]+mv[10]*data[o+2]}
  order.sort((a,b)=>d[a]-d[b]);
  for(let j=0;j<N;j++)sorted.set(data.subarray(order[j]*14,order[j]*14+14),j*14);
  gl.bindBuffer(gl.ARRAY_BUFFER,inst);gl.bufferSubData(gl.ARRAY_BUFFER,0,sorted);
  gl.uniformMatrix4fv(U('mv'),false,mv);gl.uniformMatrix4fv(U('proj'),false,proj);gl.uniform2f(U('vp'),w,h);gl.uniform1f(U('sz'),+$('size').value);
- gl.uniform3f(U('bc'),cent[0],cent[1],cent[2]);gl.uniform3f(U('bp'),bst.rmax,bst.zf,Math.max(bst.zf-bst.zmin,1e-3));gl.uniform2f(U('bq'),+$('reach').value,radius);gl.uniform1f(U('bl'),+$('blur').value);
+ gl.uniform3f(U('bc'),cent[0],cent[1],cent[2]);gl.uniform3f(U('bp'),bst.rmax,bst.zf,Math.max(bst.zf-bst.zmin,1e-3));gl.uniform2f(U('bq'),+$('reach').value,radius);gl.uniform1f(U('bl'),+$('blur').value);gl.uniform1f(U('uso'),1-mb);
  // scale applied in model matrix -> gaussian scales scale with it via mat3(mv)
  gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,N);
+}
+
+
+// ---- depth mesh: the splats' own frontal picture (colour + expected depth) baked to textures, drawn as a displaced grid.
+// A continuous surface, so it has no edge-on "shards"; it is blended with the splats (mesh blend slider) rather than replacing them.
+const BK=768, GRID=256;
+let bkTex=null, bkDep=null, meshReady=false;
+const bfsrc=`#version 300 es
+precision highp float; in vec4 vcol; in vec2 vpos; in float vz; layout(location=0) out vec4 o; layout(location=1) out vec4 o2; uniform float uso;
+void main(){ float r=dot(vpos,vpos); if(r>9.)discard; float a=exp(-.5*r)*vcol.a; o=vec4(vcol.rgb*a,a); o2=vec4(vz*a,0.,0.,a);}`;
+const pbk=gl.createProgram();gl.attachShader(pbk,sh(gl.VERTEX_SHADER,vs));gl.attachShader(pbk,sh(gl.FRAGMENT_SHADER,bfsrc));
+['corner','ctr','scl','rot','col'].forEach(n=>gl.bindAttribLocation(pbk,A(n),n));gl.linkProgram(pbk);
+if(!gl.getProgramParameter(pbk,gl.LINK_STATUS))throw gl.getProgramInfoLog(pbk);
+const mvs=`#version 300 es
+precision highp float;
+uniform mat4 mv,proj; uniform sampler2D dep; uniform vec3 mc; uniform vec4 mp; uniform float G; // mp = (camera dist, tan(fov/2), face-surface z, depth scale)
+out vec2 uv; out vec3 vpos;
+const ivec2 cc[6]=ivec2[6](ivec2(0,0),ivec2(1,0),ivec2(0,1),ivec2(1,0),ivec2(1,1),ivec2(0,1));
+void main(){
+ int n=int(G)-1, q=gl_VertexID/6;
+ ivec2 ij=ivec2(q%n,q/n)+cc[gl_VertexID%6];
+ uv=vec2(ij)/float(n);
+ vec4 t=textureLod(dep,uv,3.5);
+ float D=t.a>1e-3?t.r/t.a:mp.z;               // coverage-weighted mean depth; the mip blur smooths feature jitter and extends it past the rim
+ float z2=mp.z+(D-mp.z)*mp.w, zc=z2-mc.z;      // depth scale about the face surface...
+ vec2 nd=uv*2.-1.;                             // ...keeping the frontal picture: xy follows the camera ray at the new depth
+ vec3 p=vec3(mc.xy+nd*mp.y*(mp.x-zc),z2);
+ vec4 v=mv*vec4(p,1.); vpos=v.xyz; gl_Position=proj*v;
+}`;
+const mfs=`#version 300 es
+precision highp float; uniform sampler2D col; uniform float mw; in vec2 uv; in vec3 vpos; out vec4 o;
+void main(){
+ vec4 t=texture(col,uv); if(t.a<.02)discard;
+ vec3 n=normalize(cross(dFdx(vpos),dFdy(vpos)));
+ float f=smoothstep(.02,.15,abs(dot(n,normalize(vpos))));   // fade stretched triangles (depth jumps, grazing surfaces)
+ float a=f*smoothstep(0.,.6,t.a)*min(1.,mw*10.);
+ o=vec4(t.rgb/t.a*a,a);
+}`;
+const pms=gl.createProgram();gl.attachShader(pms,sh(gl.VERTEX_SHADER,mvs));gl.attachShader(pms,sh(gl.FRAGMENT_SHADER,mfs));gl.linkProgram(pms);
+if(!gl.getProgramParameter(pms,gl.LINK_STATUS))throw gl.getProgramInfoLog(pms);
+function bake(){
+ meshReady=false;
+ if(!gl.getExtension('EXT_color_buffer_float')||!base)return;
+ const mk=()=>{const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);gl.texStorage2D(gl.TEXTURE_2D,Math.floor(Math.log2(BK))+1,gl.RGBA16F,BK,BK);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);return t};
+ if(bkTex){gl.deleteTexture(bkTex);gl.deleteTexture(bkDep)}
+ bkTex=mk();bkDep=mk();
+ const fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+ gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,bkTex,0);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT1,gl.TEXTURE_2D,bkDep,0);
+ gl.drawBuffers([gl.COLOR_ATTACHMENT0,gl.COLOR_ATTACHMENT1]);
+ if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE){gl.bindFramebuffer(gl.FRAMEBUFFER,null);return}
+ gl.viewport(0,0,BK,BK);gl.clearBufferfv(gl.COLOR,0,[0,0,0,0]);gl.clearBufferfv(gl.COLOR,1,[0,0,0,0]);
+ // frontal, ms=1 camera: same projection the viewer uses at yaw=pitch=0
+ const dist=radius*DISTK, mv=mul(trans(0,0,-dist),trans(-cent[0],-cent[1],-cent[2])), proj=persp(FOV,1,.01,100);
+ const idx=Array.from({length:N},(_,i)=>i).sort((a,b)=>base[a*14+2]-base[b*14+2]), srt=new Float32Array(N*14);
+ idx.forEach((k,j)=>srt.set(base.subarray(k*14,k*14+14),j*14));
+ const buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buf);gl.bufferData(gl.ARRAY_BUFFER,srt,gl.STATIC_DRAW);attrs(buf);
+ gl.useProgram(pbk);const L=n=>gl.getUniformLocation(pbk,n);
+ gl.uniformMatrix4fv(L('mv'),false,mv);gl.uniformMatrix4fv(L('proj'),false,proj);gl.uniform2f(L('vp'),BK,BK);gl.uniform1f(L('sz'),1);
+ gl.uniform3f(L('bc'),cent[0],cent[1],cent[2]);gl.uniform3f(L('bp'),1,0,1);gl.uniform2f(L('bq'),.7,radius);gl.uniform1f(L('bl'),0);
+ gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,N);
+ gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.deleteFramebuffer(fb);gl.deleteBuffer(buf);
+ for(const t of [bkTex,bkDep]){gl.bindTexture(gl.TEXTURE_2D,t);gl.generateMipmap(gl.TEXTURE_2D)}
+ attrs(inst);gl.useProgram(pg);meshReady=true;dirty=true;
+}
+function drawMesh(mv,proj,mb){
+ if(!meshReady||mb<=0)return;
+ gl.useProgram(pms);const L=n=>gl.getUniformLocation(pms,n);
+ gl.activeTexture(gl.TEXTURE4);gl.bindTexture(gl.TEXTURE_2D,bkDep);gl.activeTexture(gl.TEXTURE5);gl.bindTexture(gl.TEXTURE_2D,bkTex);gl.activeTexture(gl.TEXTURE0);
+ gl.uniform1i(L('dep'),4);gl.uniform1i(L('col'),5);
+ gl.uniformMatrix4fv(L('mv'),false,mv);gl.uniformMatrix4fv(L('proj'),false,proj);
+ gl.uniform3f(L('mc'),cent[0],cent[1],cent[2]);gl.uniform4f(L('mp'),radius*DISTK,Math.tan(FOV/2),bst.zf,+$('depth').value);gl.uniform1f(L('G'),GRID);gl.uniform1f(L('mw'),mb);
+ gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);
+ gl.drawArrays(gl.TRIANGLES,0,(GRID-1)*(GRID-1)*6);
+ gl.disable(gl.DEPTH_TEST);gl.useProgram(pg);
 }
 
 // ---- backdrop: tiny low-res fill of the background, drawn behind the splats with parallax ----
