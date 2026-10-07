@@ -16,6 +16,9 @@
  <label>splat size <input type="range" id="size" min="0.5" max="6" step="0.1" value="1"></label>
  <label>model scale <input type="range" id="mscale" min="1" max="12" step="0.1" value="1"></label>
  <label>max yaw° <input type="range" id="maxyaw" min="5" max="90" step="1" value="30"></label>
+ <label>depth squash (back of head) <input type="range" id="squash" min="0.2" max="1.5" step="0.01" value="1"></label>
+ <label>edge/back blur <input type="range" id="blur" min="0" max="1" step="0.01" value="0"></label>
+ <label>blur reach <input type="range" id="reach" min="0.3" max="0.95" step="0.01" value="0.7"></label>
  <label>flip Y <input type="checkbox" id="fy"></label>
  <label>flip Z <input type="checkbox" id="fz"></label>
  <label>cutout first (Apple Vision) <input type="checkbox" id="matte" checked></label>
@@ -34,6 +37,7 @@ const $=id=>document.getElementById(id), cv=$('c'), gl=cv.getContext('webgl2',{a
 const vs=`#version 300 es
 in vec2 corner; in vec3 ctr; in vec3 scl; in vec4 rot; in vec4 col;
 uniform mat4 mv, proj; uniform vec2 vp; uniform float sz;
+uniform vec3 bc; uniform vec3 bp; uniform vec2 bq; uniform float bl; // blur: bc=centre, bp=(rmax,zface,zspan), bq=(reach,radius), bl=amount
 out vec4 vcol; out vec2 vpos;
 void main(){
  vec4 c4=mv*vec4(ctr,1.); vec3 t=c4.xyz;
@@ -44,11 +48,16 @@ void main(){
              2.*(x*z+w*y),2.*(y*z-w*x),1.-2.*(x*x+y*y));
  mat3 M=R*mat3(scl.x,0,0,0,scl.y,0,0,0,scl.z);
  mat3 S=M*transpose(M);
+ float ew=max(smoothstep(bq.x,1.,length(ctr.xy-bc.xy)/bp.x),smoothstep(.1,.6,(bp.y-ctr.z)/bp.z)); // 1 at the rim / back of the head
+ float sw=bl*ew*bq.y*.06; // extra gaussian sigma in model units
  mat3 W=mat3(mv);
  float fx=proj[0][0]*vp.x*.5, fy=proj[1][1]*vp.y*.5, z2=t.z;
  mat3 J=mat3(fx/z2,0,0, 0,fy/z2,0, -fx*t.x/(z2*z2),-fy*t.y/(z2*z2),0);
  mat3 T=J*W; mat3 C=T*S*transpose(T);
  float a=C[0][0]+.3,b=C[0][1],d=C[1][1]+.3;
+ float ba=1.;
+ if(sw>0.){mat3 TT=T*transpose(T); float a2=a+sw*sw*TT[0][0], b2=b+sw*sw*TT[0][1], d2=d+sw*sw*TT[1][1];
+  ba=sqrt(max(a*d-b*b,1e-8)/max(a2*d2-b2*b2,1e-8)); a=a2;b=b2;d=d2;} // wider gaussian, same total energy
  float mid=.5*(a+d), r=length(vec2(.5*(a-d),b));
  float l1=mid+r, l2=max(mid-r,.1);
  vec2 e1=normalize(vec2(b,l1-a)); if(abs(b)<1e-6) e1=a>=d?vec2(1,0):vec2(0,1);
@@ -56,7 +65,7 @@ void main(){
  vec2 off=(corner.x*sqrt(l1)*e1+corner.y*sqrt(l2)*e2)*3.*sz;
  vec4 p=proj*c4;
  gl_Position=vec4(p.xy/p.w+off*2./vp, p.z/p.w,1.);
- vcol=col; vpos=corner*3.;
+ vcol=vec4(col.rgb,col.a*ba); vpos=corner*3.;
 }`;
 const fs=`#version 300 es
 precision highp float; in vec4 vcol; in vec2 vpos; out vec4 o;
@@ -88,9 +97,25 @@ function parsePly(buf){
   out[o+13]=sg(f(i,'opacity'));}
  return {n,out};
 }
+let base=null,bst={rmax:1,zf:0,zmin:0,d1:1};
+const pct=(a,q)=>{const b=Float32Array.from(a).sort();return b[Math.min(b.length-1,Math.floor(q*b.length))]};
+function prep(){ // face-surface depth / head extent of the loaded splats (same definition as splatrender.unflare)
+ const z=[],r=[],zs=[];for(let i=0;i<N;i++){const o=i*14;r.push(Math.hypot(base[o]-cent[0],base[o+1]-cent[1]));zs.push(base[o+2]);if(base[o+13]>.3)z.push(base[o+2])}
+ bst={rmax:pct(r,.98)||1,zf:pct(z,.75),zmin:pct(zs,.02),d1:radius*DISTK};
+}
+function applySquash(){ // live version of unflare's squash: scale depth behind the face, keep the frontal picture (rescale xy/size from the camera)
+ if(!base)return;const k=+$('squash').value,{zf,d1}=bst;
+ for(let i=0;i<N;i++){const o=i*14;let z=base[o+2],r=1;
+  if(z<zf&&k!==1){const z2=zf+(z-zf)*k;r=Math.max(d1-(z2-cent[2]),1e-3)/Math.max(d1-(z-cent[2]),1e-3);z=z2}
+  data[o]=cent[0]+(base[o]-cent[0])*r;data[o+1]=cent[1]+(base[o+1]-cent[1])*r;data[o+2]=z;
+  data[o+3]=base[o+3]*r;data[o+4]=base[o+4]*r;data[o+5]=base[o+5]*r}
+ dirty=true;
+}
+$('squash').addEventListener('input',applySquash);
 function setSplats({n,out}){
  dirty=true;N=n;data=out;let c=[0,0,0];for(let i=0;i<n;i++)for(let k=0;k<3;k++)c[k]+=out[i*14+k]/n;cent=c;
  let r=0;for(let i=0;i<n;i++){let d=0;for(let k=0;k<3;k++)d+=(out[i*14+k]-c[k])**2;r+=Math.sqrt(d)}radius=Math.max(r/n*2,.05);
+ base=out.slice();prep();applySquash();
  order=new Uint32Array(n).map((_,i)=>i);
  sorted=new Float32Array(n*14);gl.bindBuffer(gl.ARRAY_BUFFER,inst);gl.bufferData(gl.ARRAY_BUFFER,sorted.byteLength,gl.DYNAMIC_DRAW);
  $('status').textContent=`${n} gaussians, radius≈${radius.toFixed(3)}`;
@@ -129,6 +154,7 @@ function frame(){
  for(let j=0;j<N;j++)sorted.set(data.subarray(order[j]*14,order[j]*14+14),j*14);
  gl.bindBuffer(gl.ARRAY_BUFFER,inst);gl.bufferSubData(gl.ARRAY_BUFFER,0,sorted);
  gl.uniformMatrix4fv(U('mv'),false,mv);gl.uniformMatrix4fv(U('proj'),false,proj);gl.uniform2f(U('vp'),w,h);gl.uniform1f(U('sz'),+$('size').value);
+ gl.uniform3f(U('bc'),cent[0],cent[1],cent[2]);gl.uniform3f(U('bp'),bst.rmax,bst.zf,Math.max(bst.zf-bst.zmin,1e-3));gl.uniform2f(U('bq'),+$('reach').value,radius);gl.uniform1f(U('bl'),+$('blur').value);
  // scale applied in model matrix -> gaussian scales scale with it via mat3(mv)
  gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,N);
 }
