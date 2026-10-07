@@ -16,9 +16,7 @@
  <label>splat size <input type="range" id="size" min="0.1" max="12" step="0.1" value="1"></label>
  <label>model scale <input type="range" id="mscale" min="1" max="12" step="0.1" value="1"></label>
  <label>max yaw° <input type="range" id="maxyaw" min="5" max="180" step="1" value="30"></label>
- <label>depth (0 = flat cardboard, 1 = as built) <input type="range" id="depth" min="0" max="6" step="0.01" value="1"></label>
- <label>&nbsp;&nbsp;back bias <input type="range" id="squash" min="0" max="3" step="0.01" value="1"></label>
- <label>&nbsp;&nbsp;front bias <input type="range" id="fdepth" min="0" max="3" step="0.01" value="1"></label>
+ <label>depth (0 = flat) <input type="range" id="depth" min="0" max="6" step="0.01" value="1"></label>
  <label>edge/back blur <input type="range" id="blur" min="0" max="4" step="0.01" value="0"></label>
  <label>blur reach <input type="range" id="reach" min="0" max="0.99" step="0.01" value="0.7"></label>
  <label>flip Y <input type="checkbox" id="fy"></label>
@@ -106,7 +104,7 @@ function prep(){ // face-surface depth / head extent of the loaded splats (same 
  bst={rmax:pct(r,.98)||1,zf:pct(z,.75),zmin:pct(zs,.02),d1:radius*DISTK};
 }
 function applySquash(){ // live version of unflare's squash: scale depth behind the face, keep the frontal picture (rescale xy/size from the camera)
- if(!base)return;const kd=+$('depth').value,kb=kd*$('squash').value,kf=kd*$('fdepth').value,{zf,d1}=bst;
+ if(!base)return;const kd=+$('depth').value,kb=kd,kf=kd,{zf,d1}=bst;
  for(let i=0;i<N;i++){const o=i*14;let z=base[o+2],r=1;
   const k=z<zf?kb:kf;
   if(k!==1){const z2=zf+(z-zf)*k;r=Math.max(d1-(z2-cent[2]),1e-3)/Math.max(d1-(z-cent[2]),1e-3);z=z2}
@@ -114,7 +112,7 @@ function applySquash(){ // live version of unflare's squash: scale depth behind 
   data[o+3]=base[o+3]*r;data[o+4]=base[o+4]*r;data[o+5]=base[o+5]*r}
  dirty=true;
 }
-$('squash').addEventListener('input',applySquash);$('fdepth').addEventListener('input',applySquash);$('depth').addEventListener('input',applySquash);
+$('depth').addEventListener('input',applySquash);
 function setSplats({n,out}){
  dirty=true;N=n;data=out;let c=[0,0,0];for(let i=0;i<n;i++)for(let k=0;k<3;k++)c[k]+=out[i*14+k]/n;cent=c;
  let r=0;for(let i=0;i<n;i++){let d=0;for(let k=0;k<3;k++)d+=(out[i*14+k]-c[k])**2;r+=Math.sqrt(d)}radius=Math.max(r/n*2,.05);
@@ -335,4 +333,10 @@ addEventListener('dragleave',e=>{if(!e.relatedTarget)$('drop').style.display='no
 addEventListener('drop',e=>{e.preventDefault();$('drop').style.display='none';load(e.dataTransfer.files[0])});
 frame();
 fetch('out.ply').then(r=>r.ok&&r.arrayBuffer()).then(b=>b&&setSplats(parsePly(b))).catch(()=>{});
+
+document.querySelectorAll('input[type=range]').forEach(r=>{
+ const o=document.createElement('output');o.style.cssText='margin-left:6px;font:11px monospace;opacity:.8';
+ const upd=()=>o.textContent=(+r.value)+(r.value!==r.defaultValue?'  (default '+r.defaultValue+')':'');
+ r.after(o);r.addEventListener('input',upd);r.addEventListener('dblclick',()=>{r.value=r.defaultValue;r.dispatchEvent(new Event('input',{bubbles:true}))});upd();
+});
 </script>
